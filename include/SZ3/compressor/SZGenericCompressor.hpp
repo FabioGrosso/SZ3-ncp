@@ -59,7 +59,6 @@ class SZGenericCompressor : public concepts::CompressorInterface<T> {
         
         auto cmpSize = lossless.compress(buffer, buffer_pos - buffer, cmpData, cmpCap);
         free(buffer);
-
         return cmpSize;
     }
 
