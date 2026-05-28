@@ -16,13 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <algorithm>
 #include <map>
 #include <set>
-#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 namespace SZ3 {
 
@@ -101,7 +98,6 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
      */
     void preprocess_encode(const T *bins, size_t num_bin, int stateNum) {
         nodeCount = 0;
-        markerSizeEst = marker_header_size(getMarkerConfig(num_bin));
         if (num_bin == 0) {
             fprintf(stderr, "Huffman bins should not be empty\n");
             throw std::invalid_argument("Huffman bins should not be empty");
@@ -136,7 +132,7 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         size_t b = (nodeCount <= 256) ? sizeof(unsigned char)
                                       : ((nodeCount <= 65536) ? sizeof(unsigned short) : sizeof(unsigned int));
         return 1 + 2 * nodeCount * b + nodeCount * sizeof(unsigned char) + nodeCount * sizeof(T) + sizeof(int) +
-               sizeof(int) + sizeof(T) + markerSizeEst;
+               sizeof(int) + sizeof(T);
     }
 
     // perform encoding
@@ -144,11 +140,6 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
     // perform encoding
     size_t encode(const T *bins, size_t num_bin, uchar *&bytes) {
-        const MarkerConfig markerConfig = getMarkerConfig(num_bin);
-        if (markerConfig.enabled) {
-            return encode_marked(bins, num_bin, markerConfig, bytes);
-        }
-
         size_t outSize = 0;
         size_t i = 0;
         unsigned char bitSize = 0, byteSize, byteSizep;
@@ -241,12 +232,6 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         node n = treeRoot;
         size_t encodedLength = *reinterpret_cast<const size_t *>(bytes);
         bytes += sizeof(size_t);
-
-        MarkerConfig markerConfig = getMarkerConfig(targetLength);
-        if (markerConfig.enabled) {
-            return decode_marked(bytes, targetLength, encodedLength, markerConfig);
-        }
-
         if (n->t)  // root->t==1 means that all state values are the same (constant)
         {
             for (count = 0; count < targetLength; count++) out[count] = n->c + offset;
@@ -269,18 +254,6 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         }
         bytes += encodedLength;
         return out;
-    }
-
-    std::vector<T> decode_marked_chunks(const uchar *&bytes, size_t targetLength,
-                                        const std::vector<size_t> &rowMajorChunks) {
-        const size_t encodedLength = *reinterpret_cast<const size_t *>(bytes);
-        bytes += sizeof(size_t);
-        const MarkerConfig markerConfig = getMarkerConfig(targetLength);
-        if (!markerConfig.enabled) {
-            bytes -= sizeof(size_t);
-            return decode(bytes, targetLength);
-        }
-        return decode_marked_chunks_impl(bytes, encodedLength, markerConfig, rowMajorChunks);
     }
 
     // empty function
@@ -310,250 +283,12 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
     bool isLoaded() const { return loaded; }
 
    private:
-    struct MarkerConfig {
-        bool enabled = false;
-        size_t blockDim = 0;
-        size_t chunkDim = 0;
-        size_t chunksPerDim = 0;
-        size_t chunkCount = 0;
-    };
-
     HuffmanTree *huffmanTree = NULL;
     node treeRoot;
     unsigned int nodeCount = 0;
     uchar sysEndianType;  // 0: little endian, 1: big endian
     bool loaded = false;
     T offset;
-    size_t markerSizeEst = 0;
-
-    MarkerConfig getMarkerConfig(size_t num_bin) const {
-        MarkerConfig config;
-        if (num_bin == static_cast<size_t>(128) * 128 * 128) {
-            config.enabled = true;
-            config.blockDim = 128;
-            config.chunkDim = 16;
-        } else if (num_bin == static_cast<size_t>(256) * 256 * 256) {
-            config.enabled = true;
-            config.blockDim = 256;
-            config.chunkDim = 32;
-        } else {
-            return config;
-        }
-        config.chunksPerDim = config.blockDim / config.chunkDim;
-        config.chunkCount = config.chunksPerDim * config.chunksPerDim * config.chunksPerDim;
-        return config;
-    }
-
-    size_t marker_header_size(const MarkerConfig &config) const {
-        if (!config.enabled) return 0;
-        return config.chunkCount * sizeof(uint64_t);
-    }
-
-    std::vector<size_t> morton_chunk_order(const MarkerConfig &config) const {
-        std::vector<size_t> order;
-        order.reserve(config.chunkCount);
-        size_t bits = 0;
-        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
-            bits++;
-        }
-        for (size_t code = 0; code < config.chunkCount; ++code) {
-            size_t cx = 0, cy = 0, cz = 0;
-            for (size_t bit = 0; bit < bits; ++bit) {
-                cx |= ((code >> (3 * bit)) & 1u) << bit;
-                cy |= ((code >> (3 * bit + 1)) & 1u) << bit;
-                cz |= ((code >> (3 * bit + 2)) & 1u) << bit;
-            }
-            order.push_back((cz * config.chunksPerDim + cy) * config.chunksPerDim + cx);
-        }
-        return order;
-    }
-
-    size_t linear_index_in_block(size_t rowMajorChunk, size_t localIndex, const MarkerConfig &config) const {
-        const size_t cx = rowMajorChunk % config.chunksPerDim;
-        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
-        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
-        const size_t lx = localIndex % config.chunkDim;
-        const size_t ly = (localIndex / config.chunkDim) % config.chunkDim;
-        const size_t lz = localIndex / (config.chunkDim * config.chunkDim);
-        const size_t x = cx * config.chunkDim + lx;
-        const size_t y = cy * config.chunkDim + ly;
-        const size_t z = cz * config.chunkDim + lz;
-        return (z * config.blockDim + y) * config.blockDim + x;
-    }
-
-    void write_marker_header(uchar *header, const MarkerConfig &config, const std::vector<uint64_t> &bitOffsets) const {
-        memcpy(header, bitOffsets.data(), config.chunkCount * sizeof(uint64_t));
-    }
-
-    const uint64_t *read_marker_header(const uchar *&bytes, const MarkerConfig &config) const {
-        const uint64_t *bitOffsets = reinterpret_cast<const uint64_t *>(bytes);
-        bytes += marker_header_size(config);
-        return bitOffsets;
-    }
-
-    void encode_one_symbol(const T *bins, size_t index, uchar *&p, size_t &outSize,
-                           size_t &totalBitSize, int &lackBits) {
-        unsigned char bitSize = 0, byteSize, byteSizep;
-        int state = bins[index] - offset;
-        bitSize = huffmanTree->cout[state];
-        totalBitSize += bitSize;
-
-        if (lackBits == 0) {
-            byteSize = bitSize % 8 == 0 ? bitSize / 8 : bitSize / 8 + 1;
-            byteSizep = bitSize / 8;
-            if (byteSize <= 8) {
-                int64ToBytes_bigEndian(p, (huffmanTree->code[state])[0]);
-                p += byteSizep;
-            } else {
-                int64ToBytes_bigEndian(p, (huffmanTree->code[state])[0]);
-                p += 8;
-                int64ToBytes_bigEndian(p, (huffmanTree->code[state])[1]);
-                p += (byteSizep - 8);
-            }
-            outSize += byteSize;
-            lackBits = bitSize % 8 == 0 ? 0 : 8 - bitSize % 8;
-        } else {
-            *p = (*p) | static_cast<unsigned char>((huffmanTree->code[state])[0] >> (64 - lackBits));
-            if (lackBits < bitSize) {
-                p++;
-                int64_t newCode = (huffmanTree->code[state])[0] << lackBits;
-                int64ToBytes_bigEndian(p, newCode);
-
-                if (bitSize <= 64) {
-                    bitSize -= lackBits;
-                    byteSize = bitSize % 8 == 0 ? bitSize / 8 : bitSize / 8 + 1;
-                    byteSizep = bitSize / 8;
-                    p += byteSizep;
-                    outSize += byteSize;
-                    lackBits = bitSize % 8 == 0 ? 0 : 8 - bitSize % 8;
-                } else {
-                    byteSizep = 7;
-                    p += byteSizep;
-                    outSize += byteSize;
-
-                    bitSize -= 64;
-                    if (lackBits < bitSize) {
-                        *p = (*p) | static_cast<unsigned char>((huffmanTree->code[state])[0] >> (64 - lackBits));
-                        p++;
-                        newCode = (huffmanTree->code[state])[1] << lackBits;
-                        int64ToBytes_bigEndian(p, newCode);
-                        bitSize -= lackBits;
-                        byteSize = bitSize % 8 == 0 ? bitSize / 8 : bitSize / 8 + 1;
-                        byteSizep = bitSize / 8;
-                        p += byteSizep;
-                        outSize += byteSize;
-                        lackBits = bitSize % 8 == 0 ? 0 : 8 - bitSize % 8;
-                    } else {
-                        *p = (*p) | static_cast<unsigned char>((huffmanTree->code[state])[0] >> (64 - bitSize));
-                        lackBits -= bitSize;
-                    }
-                }
-            } else {
-                lackBits -= bitSize;
-                if (lackBits == 0) p++;
-            }
-        }
-    }
-
-    size_t encode_marked(const T *bins, size_t num_bin, const MarkerConfig &config, uchar *&bytes) {
-        size_t outSize = 0;
-        size_t totalBitSize = 0;
-        int lackBits = 0;
-        std::vector<uint64_t> bitOffsets(config.chunkCount, 0);
-        const auto order = morton_chunk_order(config);
-
-        uchar *header = bytes + sizeof(size_t);
-        uchar *p = header + marker_header_size(config);
-        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
-        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
-            bitOffsets[ordinal] = static_cast<uint64_t>(totalBitSize);
-            const size_t rowMajorChunk = order[ordinal];
-            for (size_t local = 0; local < chunkVolume; ++local) {
-                encode_one_symbol(bins, linear_index_in_block(rowMajorChunk, local, config),
-                                  p, outSize, totalBitSize, lackBits);
-            }
-        }
-
-        write_marker_header(header, config, bitOffsets);
-        *reinterpret_cast<size_t *>(bytes) = outSize;
-        bytes += sizeof(size_t) + marker_header_size(config) + outSize;
-        return marker_header_size(config) + outSize;
-    }
-
-    T decode_one_symbol_from_bit(const uchar *bitstream, size_t &bitIndex, node root) const {
-        node n = root;
-        while (true) {
-            const size_t byteIndex = bitIndex >> 3;
-            const int r = bitIndex % 8;
-            if (((bitstream[byteIndex] >> (7 - r)) & 0x01) == 0)
-                n = n->left;
-            else
-                n = n->right;
-            bitIndex++;
-            if (n->t) {
-                return n->c + offset;
-            }
-        }
-    }
-
-    std::vector<T> decode_marked(const uchar *&bytes, size_t targetLength, size_t encodedLength,
-                                 const MarkerConfig &config) {
-        std::vector<T> out(targetLength);
-        const uint64_t *bitOffsets = read_marker_header(bytes, config);
-        const uchar *bitstream = bytes;
-
-        if (treeRoot->t) {
-            for (size_t i = 0; i < targetLength; i++) out[i] = treeRoot->c + offset;
-            bytes += encodedLength;
-            return out;
-        }
-
-        const auto order = morton_chunk_order(config);
-        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
-        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
-            size_t bitIndex = bitOffsets[ordinal];
-            const size_t rowMajorChunk = order[ordinal];
-            for (size_t local = 0; local < chunkVolume; ++local) {
-                out[linear_index_in_block(rowMajorChunk, local, config)] =
-                    decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
-            }
-        }
-
-        bytes += encodedLength;
-        return out;
-    }
-
-    std::vector<T> decode_marked_chunks_impl(const uchar *&bytes, size_t encodedLength,
-                                             const MarkerConfig &config,
-                                             const std::vector<size_t> &rowMajorChunks) {
-        const uint64_t *bitOffsets = read_marker_header(bytes, config);
-        const uchar *bitstream = bytes;
-        const auto order = morton_chunk_order(config);
-        std::vector<size_t> rowMajorToOrdinal(config.chunkCount, 0);
-        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
-            rowMajorToOrdinal[order[ordinal]] = ordinal;
-        }
-
-        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
-        std::vector<T> out(rowMajorChunks.size() * chunkVolume);
-        if (treeRoot->t) {
-            std::fill(out.begin(), out.end(), treeRoot->c + offset);
-            bytes += encodedLength;
-            return out;
-        }
-
-        size_t outOffset = 0;
-        for (size_t rowMajorChunk : rowMajorChunks) {
-            const size_t ordinal = rowMajorToOrdinal[rowMajorChunk];
-            size_t bitIndex = bitOffsets[ordinal];
-            for (size_t local = 0; local < chunkVolume; ++local) {
-                out[outOffset++] = decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
-            }
-        }
-
-        bytes += encodedLength;
-        return out;
-    }
 
     node reconstruct_HuffTree_from_bytes_anyStates(const unsigned char *bytes, uint nodeCount) {
         if (nodeCount <= 256) {
