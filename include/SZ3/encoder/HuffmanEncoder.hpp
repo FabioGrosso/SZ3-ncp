@@ -309,6 +309,16 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
     bool isLoaded() const { return loaded; }
 
+    static void set_forced_marker(size_t blockDim, size_t chunkDim) {
+        forced_marker_block_dim() = blockDim;
+        forced_marker_chunk_dim() = chunkDim;
+    }
+
+    static void clear_forced_marker() {
+        forced_marker_block_dim() = 0;
+        forced_marker_chunk_dim() = 0;
+    }
+
    private:
     struct MarkerConfig {
         bool enabled = false;
@@ -326,9 +336,26 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
     T offset;
     size_t markerSizeEst = 0;
 
+    static size_t &forced_marker_block_dim() {
+        static thread_local size_t value = 0;
+        return value;
+    }
+
+    static size_t &forced_marker_chunk_dim() {
+        static thread_local size_t value = 0;
+        return value;
+    }
+
     MarkerConfig getMarkerConfig(size_t num_bin) const {
         MarkerConfig config;
-        if (num_bin == static_cast<size_t>(128) * 128 * 128) {
+        const size_t forcedBlockDim = forced_marker_block_dim();
+        const size_t forcedChunkDim = forced_marker_chunk_dim();
+        if (forcedBlockDim > 0 && forcedChunkDim > 0 &&
+            num_bin == forcedBlockDim * forcedBlockDim * forcedBlockDim) {
+            config.enabled = true;
+            config.blockDim = forcedBlockDim;
+            config.chunkDim = forcedChunkDim;
+        } else if (num_bin == static_cast<size_t>(128) * 128 * 128) {
             config.enabled = true;
             config.blockDim = 128;
             config.chunkDim = 16;
@@ -338,6 +365,9 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
             config.chunkDim = 32;
         } else {
             return config;
+        }
+        if (config.blockDim == 0 || config.chunkDim == 0 || config.blockDim % config.chunkDim != 0) {
+            return MarkerConfig{};
         }
         config.chunksPerDim = config.blockDim / config.chunkDim;
         config.chunkCount = config.chunksPerDim * config.chunksPerDim * config.chunksPerDim;
@@ -368,17 +398,35 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         return order;
     }
 
-    size_t linear_index_in_block(size_t rowMajorChunk, size_t localIndex, const MarkerConfig &config) const {
+    size_t morton_to_row_major_chunk(size_t ordinal, const MarkerConfig &config) const {
+        size_t bits = 0;
+        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
+            bits++;
+        }
+        size_t cx = 0, cy = 0, cz = 0;
+        for (size_t bit = 0; bit < bits; ++bit) {
+            cx |= ((ordinal >> (3 * bit)) & 1u) << bit;
+            cy |= ((ordinal >> (3 * bit + 1)) & 1u) << bit;
+            cz |= ((ordinal >> (3 * bit + 2)) & 1u) << bit;
+        }
+        return (cz * config.chunksPerDim + cy) * config.chunksPerDim + cx;
+    }
+
+    size_t row_major_chunk_to_morton(size_t rowMajorChunk, const MarkerConfig &config) const {
         const size_t cx = rowMajorChunk % config.chunksPerDim;
         const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
         const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
-        const size_t lx = localIndex % config.chunkDim;
-        const size_t ly = (localIndex / config.chunkDim) % config.chunkDim;
-        const size_t lz = localIndex / (config.chunkDim * config.chunkDim);
-        const size_t x = cx * config.chunkDim + lx;
-        const size_t y = cy * config.chunkDim + ly;
-        const size_t z = cz * config.chunkDim + lz;
-        return (z * config.blockDim + y) * config.blockDim + x;
+        size_t bits = 0;
+        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
+            bits++;
+        }
+        size_t ordinal = 0;
+        for (size_t bit = 0; bit < bits; ++bit) {
+            ordinal |= ((cx >> bit) & 1u) << (3 * bit);
+            ordinal |= ((cy >> bit) & 1u) << (3 * bit + 1);
+            ordinal |= ((cz >> bit) & 1u) << (3 * bit + 2);
+        }
+        return ordinal;
     }
 
     void write_marker_header(uchar *header, const MarkerConfig &config, const std::vector<uint64_t> &bitOffsets) const {
@@ -455,23 +503,38 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         }
     }
 
+    void encode_chunk_symbols(const T *bins, size_t rowMajorChunk, const MarkerConfig &config,
+                              uchar *&p, size_t &outSize, size_t &totalBitSize, int &lackBits) {
+        const size_t cx = rowMajorChunk % config.chunksPerDim;
+        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
+        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
+        const size_t x0 = cx * config.chunkDim;
+        const size_t y0 = cy * config.chunkDim;
+        const size_t z0 = cz * config.chunkDim;
+        const size_t plane = config.blockDim * config.blockDim;
+        for (size_t lz = 0; lz < config.chunkDim; ++lz) {
+            const size_t zBase = (z0 + lz) * plane;
+            for (size_t ly = 0; ly < config.chunkDim; ++ly) {
+                size_t index = zBase + (y0 + ly) * config.blockDim + x0;
+                for (size_t lx = 0; lx < config.chunkDim; ++lx, ++index) {
+                    encode_one_symbol(bins, index, p, outSize, totalBitSize, lackBits);
+                }
+            }
+        }
+    }
+
     size_t encode_marked(const T *bins, size_t num_bin, const MarkerConfig &config, uchar *&bytes) {
         size_t outSize = 0;
         size_t totalBitSize = 0;
         int lackBits = 0;
         std::vector<uint64_t> bitOffsets(config.chunkCount, 0);
-        const auto order = morton_chunk_order(config);
 
         uchar *header = bytes + sizeof(size_t);
         uchar *p = header + marker_header_size(config);
-        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
         for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
             bitOffsets[ordinal] = static_cast<uint64_t>(totalBitSize);
-            const size_t rowMajorChunk = order[ordinal];
-            for (size_t local = 0; local < chunkVolume; ++local) {
-                encode_one_symbol(bins, linear_index_in_block(rowMajorChunk, local, config),
-                                  p, outSize, totalBitSize, lackBits);
-            }
+            encode_chunk_symbols(bins, morton_to_row_major_chunk(ordinal, config),
+                                 config, p, outSize, totalBitSize, lackBits);
         }
 
         write_marker_header(header, config, bitOffsets);
@@ -496,6 +559,26 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         }
     }
 
+    void decode_chunk_to_full(std::vector<T> &out, const uchar *bitstream, size_t &bitIndex,
+                              size_t rowMajorChunk, const MarkerConfig &config) const {
+        const size_t cx = rowMajorChunk % config.chunksPerDim;
+        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
+        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
+        const size_t x0 = cx * config.chunkDim;
+        const size_t y0 = cy * config.chunkDim;
+        const size_t z0 = cz * config.chunkDim;
+        const size_t plane = config.blockDim * config.blockDim;
+        for (size_t lz = 0; lz < config.chunkDim; ++lz) {
+            const size_t zBase = (z0 + lz) * plane;
+            for (size_t ly = 0; ly < config.chunkDim; ++ly) {
+                size_t index = zBase + (y0 + ly) * config.blockDim + x0;
+                for (size_t lx = 0; lx < config.chunkDim; ++lx, ++index) {
+                    out[index] = decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
+                }
+            }
+        }
+    }
+
     std::vector<T> decode_marked(const uchar *&bytes, size_t targetLength, size_t encodedLength,
                                  const MarkerConfig &config) {
         std::vector<T> out(targetLength);
@@ -508,15 +591,10 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
             return out;
         }
 
-        const auto order = morton_chunk_order(config);
-        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
         for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
             size_t bitIndex = bitOffsets[ordinal];
-            const size_t rowMajorChunk = order[ordinal];
-            for (size_t local = 0; local < chunkVolume; ++local) {
-                out[linear_index_in_block(rowMajorChunk, local, config)] =
-                    decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
-            }
+            decode_chunk_to_full(out, bitstream, bitIndex,
+                                 morton_to_row_major_chunk(ordinal, config), config);
         }
 
         bytes += encodedLength;
@@ -528,11 +606,6 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
                                              const std::vector<size_t> &rowMajorChunks) {
         const uint64_t *bitOffsets = read_marker_header(bytes, config);
         const uchar *bitstream = bytes;
-        const auto order = morton_chunk_order(config);
-        std::vector<size_t> rowMajorToOrdinal(config.chunkCount, 0);
-        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
-            rowMajorToOrdinal[order[ordinal]] = ordinal;
-        }
 
         const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
         std::vector<T> out(rowMajorChunks.size() * chunkVolume);
@@ -544,7 +617,7 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
         size_t outOffset = 0;
         for (size_t rowMajorChunk : rowMajorChunks) {
-            const size_t ordinal = rowMajorToOrdinal[rowMajorChunk];
+            const size_t ordinal = row_major_chunk_to_morton(rowMajorChunk, config);
             size_t bitIndex = bitOffsets[ordinal];
             for (size_t local = 0; local < chunkVolume; ++local) {
                 out[outOffset++] = decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
