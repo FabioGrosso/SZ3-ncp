@@ -283,6 +283,187 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         return decode_marked_chunks_impl(bytes, encodedLength, markerConfig, rowMajorChunks);
     }
 
+    // Histogram-based variant of preprocess_encode() for integer symbol
+    // streams with a modest value range: min/max scan + array counts instead
+    // of the hash-map frequency pass. Builds an equally optimal Huffman tree,
+    // but tie-breaking order can differ from preprocess_encode(), so the
+    // emitted bytes (not the decoded values) may differ slightly.
+    void preprocess_encode_fast(const T *bins, size_t num_bin, int stateNum) {
+        nodeCount = 0;
+        markerSizeEst = marker_header_size(getMarkerConfig(num_bin));
+        if (num_bin == 0) {
+            fprintf(stderr, "Huffman bins should not be empty\n");
+            throw std::invalid_argument("Huffman bins should not be empty");
+        }
+        // symbols are expected in [0, stateNum] (quantizer output range), so
+        // histogram in one pass over a fixed-size table; out-of-range symbols
+        // fall back to the generic hash-map path
+        if (stateNum < 0 || static_cast<size_t>(stateNum) > (static_cast<size_t>(1) << 22)) {
+            preprocess_encode(bins, num_bin, stateNum);
+            return;
+        }
+        const size_t table = static_cast<size_t>(stateNum) + 1;
+        // 4 interleaved count tables: runs of one dominant symbol would
+        // otherwise serialize on store-to-load forwarding of a single counter
+        std::vector<size_t> freq4(4 * table, 0);
+        size_t* f0 = freq4.data();
+        size_t* f1 = f0 + table;
+        size_t* f2 = f1 + table;
+        size_t* f3 = f2 + table;
+        size_t oor = 0;
+        size_t i = 0;
+        for (; i + 4 <= num_bin; i += 4) {
+            const size_t u0 = static_cast<size_t>(static_cast<int64_t>(bins[i]));
+            const size_t u1 = static_cast<size_t>(static_cast<int64_t>(bins[i + 1]));
+            const size_t u2 = static_cast<size_t>(static_cast<int64_t>(bins[i + 2]));
+            const size_t u3 = static_cast<size_t>(static_cast<int64_t>(bins[i + 3]));
+            if (u0 < table) f0[u0]++; else oor++;
+            if (u1 < table) f1[u1]++; else oor++;
+            if (u2 < table) f2[u2]++; else oor++;
+            if (u3 < table) f3[u3]++; else oor++;
+        }
+        for (; i < num_bin; i++) {
+            const size_t u = static_cast<size_t>(static_cast<int64_t>(bins[i]));
+            if (u < table) f0[u]++; else oor++;
+        }
+        if (oor) {
+            preprocess_encode(bins, num_bin, stateNum);
+            return;
+        }
+        std::vector<size_t> freq(table);
+        for (size_t k = 0; k < table; ++k) {
+            freq[k] = f0[k] + f1[k] + f2[k] + f3[k];
+        }
+        size_t lo = 0, hi = table - 1;
+        while (lo < hi && !freq[lo]) lo++;
+        while (hi > lo && !freq[hi]) hi--;
+
+        offset = static_cast<T>(lo);
+        huffmanTree = createHuffmanTree(static_cast<int>(hi - lo) + 2);
+        for (size_t k = lo; k <= hi; ++k) {
+            if (freq[k]) {
+                qinsert(new_node(freq[k], static_cast<T>(k - lo), nullptr, nullptr));
+            }
+        }
+        while (huffmanTree->qend > 2) qinsert(new_node(0, 0, qremove(), qremove()));
+        build_code(huffmanTree->qq[1], 0, 0, 0);
+        treeRoot = huffmanTree->qq[1];
+        for (uint i = 0; i < huffmanTree->stateNum; i++)
+            if (huffmanTree->code[i]) nodeCount++;
+        nodeCount = nodeCount * 2 - 1;
+    }
+
+    // Bit-buffered variant of encode() for marked streams: identical output
+    // bytes (64-bit MSB-first accumulator instead of per-symbol byte RMW in
+    // memory). Falls back to encode() when no marker config applies. Assumes
+    // all codeword lengths <= 64 bits, which holds for any input shorter than
+    // ~2^45 symbols.
+    size_t encode_marked_fast(const T *bins, size_t num_bin, uchar *&bytes) {
+        const MarkerConfig config = getMarkerConfig(num_bin);
+        if (!config.enabled) {
+            return encode(bins, num_bin, bytes);
+        }
+        uchar *header = bytes + sizeof(size_t);
+        uchar *p = header + marker_header_size(config);
+        uchar *const stream_start = p;
+        std::vector<uint64_t> bitOffsets(config.chunkCount, 0);
+
+        // flatten the per-state code pointers into contiguous arrays so the
+        // per-symbol lookup is one indexed load instead of a pointer chase
+        const int stateNum = static_cast<int>(huffmanTree->stateNum);
+        std::vector<uint64_t> flatCode(stateNum, 0);
+        std::vector<uint8_t> flatLen(stateNum, 0);
+        for (int s = 0; s < stateNum; ++s) {
+            if (huffmanTree->code[s]) {
+                flatCode[s] = (huffmanTree->code[s])[0];
+                flatLen[s] = huffmanTree->cout[s];
+            }
+        }
+        const uint64_t *fc = flatCode.data();
+        const uint8_t *fl = flatLen.data();
+
+        uint64_t acc = 0;
+        int accBits = 0;
+        uint64_t totalBits = 0;
+        auto put_bits = [&](uint64_t codeLeftAligned, int len) {
+            acc |= codeLeftAligned >> accBits;
+            const int total = accBits + len;
+            if (total >= 64) {
+                for (int b = 0; b < 8; ++b) p[b] = static_cast<uchar>(acc >> (56 - 8 * b));
+                p += 8;
+                const int rem = total - 64;
+                acc = (rem == 0) ? 0 : (codeLeftAligned << (len - rem));
+                accBits = rem;
+            } else {
+                accBits = total;
+            }
+        };
+
+        const size_t plane = config.blockDimX * config.blockDimY;
+        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
+            bitOffsets[ordinal] = totalBits;
+            const size_t rowMajorChunk = morton_to_row_major_chunk(ordinal, config);
+            const size_t cx = rowMajorChunk % config.chunksPerDimX;
+            const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+            const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
+            const size_t x0 = cx * config.chunkDim;
+            const size_t y0 = cy * config.chunkDim;
+            const size_t z0 = cz * config.chunkDim;
+            for (size_t lz = 0; lz < config.chunkDim; ++lz) {
+                const size_t zBase = (z0 + lz) * plane;
+                for (size_t ly = 0; ly < config.chunkDim; ++ly) {
+                    size_t index = zBase + (y0 + ly) * config.blockDimX + x0;
+                    size_t lx = 0;
+                    while (lx < config.chunkDim) {
+                        const T sym = bins[index];
+                        const int state = sym - offset;
+                        const int len = fl[state];
+                        const uint64_t code = fc[state];
+                        if (code == 0) {
+                            // all-zero codeword (the dominant symbol in residual
+                            // streams): a run contributes only zero bits, so the
+                            // whole run advances the bit position in O(1)
+                            size_t run = 1;
+                            while (lx + run < config.chunkDim && bins[index + run] == sym) run++;
+                            const uint64_t bits = static_cast<uint64_t>(len) * run;
+                            totalBits += bits;
+                            const uint64_t total = static_cast<uint64_t>(accBits) + bits;
+                            if (total >= 64) {
+                                for (int b = 0; b < 8; ++b) p[b] = static_cast<uchar>(acc >> (56 - 8 * b));
+                                p += 8;
+                                const uint64_t zwords = (total - 64) / 64;
+                                memset(p, 0, zwords * 8);
+                                p += zwords * 8;
+                                acc = 0;
+                                accBits = static_cast<int>((total - 64) % 64);
+                            } else {
+                                accBits = static_cast<int>(total);
+                            }
+                            index += run;
+                            lx += run;
+                            continue;
+                        }
+                        put_bits(code, len);
+                        totalBits += len;
+                        ++index;
+                        ++lx;
+                    }
+                }
+            }
+        }
+        // flush the partial accumulator (high bytes first; low bits are zero)
+        for (int b = 0; accBits > 0; accBits -= 8, ++b) {
+            *p++ = static_cast<uchar>(acc >> (56 - 8 * b));
+        }
+        const size_t outSize = static_cast<size_t>((totalBits + 7) / 8);
+        (void)stream_start;
+
+        write_marker_header(header, config, bitOffsets);
+        *reinterpret_cast<size_t *>(bytes) = outSize;
+        bytes += sizeof(size_t) + marker_header_size(config) + outSize;
+        return marker_header_size(config) + outSize;
+    }
+
     // Table-accelerated variant of decode(). Identical stream layout and identical
     // output; only the per-symbol bit-by-bit tree walk is replaced by a
     // kFastTableBits-wide prefix lookup (rare longer codes fall back to the walk).
@@ -350,6 +531,10 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         build_fast_table();
         const size_t fastBitLimit = encodedLength >= 8 ? (encodedLength - 7) * 8 : 0;
         const size_t plane = config.blockDimX * config.blockDimY;
+        // Chunks decode independently from their marker offsets, so they can be
+        // decoded in parallel (fn must be thread-safe). Inside an enclosing
+        // parallel region this collapses to a serial loop.
+        #pragma omp parallel for schedule(dynamic)
         for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
             size_t bitIndex = bitOffsets[ordinal];
             const size_t rowMajorChunk = morton_to_row_major_chunk(ordinal, config);
@@ -481,12 +666,20 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
     // barely beats the tree walk. Instead each kFastTableBits-wide prefix entry
     // pre-decodes every complete code inside the window (up to kFastMaxSyms
     // symbols at once), with cumulative bit counts so a run can stop mid-entry.
+    // Table footprint is (1 << bits) * ~(4*bits + 8) bytes: 12 -> ~288KB (fits a
+    // 1MB Cascade Lake L2), 14 -> ~1.3MB (needs a 2MB L2, e.g. Granite Rapids).
+    // Override with -DSZ_FAST_HUFF_TABLE_BITS=N at compile time.
+#ifdef SZ_FAST_HUFF_TABLE_BITS
+    static constexpr int kFastTableBits = SZ_FAST_HUFF_TABLE_BITS;
+#else
     static constexpr int kFastTableBits = 12;
+#endif
     static constexpr int kFastMaxSyms = kFastTableBits;  // codes are >= 1 bit each
     struct FastDecodeEntry {
         T syms[kFastMaxSyms];
         uint8_t cumBits[kFastMaxSyms];  // bits consumed after emitting syms[0..k]
         uint8_t nsym;                   // complete symbols in the window; 0 -> escape
+        uint8_t uniform;                // all nsym symbols identical (e.g. a zero run)
     };
     std::vector<FastDecodeEntry> fastTable;
     std::vector<node> fastEscape;  // subtree to continue the walk from, for escape prefixes
@@ -514,6 +707,13 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
                     }
                 }
                 e.nsym = static_cast<uint8_t>(count);
+                e.uniform = 1;
+                for (int k = 1; k < count; ++k) {
+                    if (e.syms[k] != e.syms[0]) {
+                        e.uniform = 0;
+                        break;
+                    }
+                }
                 if (count == 0) {
                     fastEscape[p] = n;  // node reached after consuming the whole window
                 }
@@ -545,7 +745,14 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
                 const FastDecodeEntry &e = fastTable[prefix];
                 if (e.nsym) {
                     const size_t m = std::min<size_t>(e.nsym, count - i);
-                    for (size_t k = 0; k < m; ++k) emit(i + k, e.syms[k]);
+                    if (e.uniform) {
+                        // constant symbol run: lets the caller's emit hoist its
+                        // per-symbol work (e.g. the recover lookup) out of the loop
+                        const T s0 = e.syms[0];
+                        for (size_t k = 0; k < m; ++k) emit(i + k, s0);
+                    } else {
+                        for (size_t k = 0; k < m; ++k) emit(i + k, e.syms[k]);
+                    }
                     bitIndex += e.cumBits[m - 1];
                     i += m;
                     continue;
