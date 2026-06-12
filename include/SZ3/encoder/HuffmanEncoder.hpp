@@ -283,6 +283,132 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         return decode_marked_chunks_impl(bytes, encodedLength, markerConfig, rowMajorChunks);
     }
 
+    // Table-accelerated variant of decode(). Identical stream layout and identical
+    // output; only the per-symbol bit-by-bit tree walk is replaced by a
+    // kFastTableBits-wide prefix lookup (rare longer codes fall back to the walk).
+    std::vector<T> decode_fast(const uchar *&bytes, size_t targetLength) {
+        const size_t encodedLength = *reinterpret_cast<const size_t *>(bytes);
+        bytes += sizeof(size_t);
+        const MarkerConfig config = getMarkerConfig(targetLength);
+        std::vector<T> out(targetLength);
+
+        if (config.enabled) {
+            const uint64_t *bitOffsets = read_marker_header(bytes, config);
+            const uchar *bitstream = bytes;
+            if (treeRoot->t) {
+                for (size_t i = 0; i < targetLength; i++) out[i] = treeRoot->c + offset;
+                bytes += encodedLength;
+                return out;
+            }
+            build_fast_table();
+            const size_t fastBitLimit = encodedLength >= 8 ? (encodedLength - 7) * 8 : 0;
+            for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
+                size_t bitIndex = bitOffsets[ordinal];
+                decode_chunk_to_full_fast(out, bitstream, bitIndex,
+                                          morton_to_row_major_chunk(ordinal, config), config, fastBitLimit);
+            }
+            bytes += encodedLength;
+            return out;
+        }
+
+        if (treeRoot->t) {
+            // decode() does not advance bytes in the constant case; mirror it.
+            for (size_t i = 0; i < targetLength; i++) out[i] = treeRoot->c + offset;
+            return out;
+        }
+        build_fast_table();
+        const size_t fastBitLimit = encodedLength >= 8 ? (encodedLength - 7) * 8 : 0;
+        size_t bitIndex = 0;
+        T *dst = out.data();
+        decode_run_fast(bytes, bitIndex, fastBitLimit, targetLength,
+                        [dst](size_t k, T sym) { dst[k] = sym; });
+        bytes += encodedLength;
+        return out;
+    }
+
+    // Decode a marked stream and write fn(rowMajorIndex, symbol) straight into
+    // out[rowMajorIndex] (full row-major layout), skipping the intermediate
+    // symbol vector. Returns false when the stream has no marker config (caller
+    // should fall back to decode()/decode_fast()); bytes is left untouched then.
+    template <class OutT, class Fn>
+    bool decode_marked_transform(const uchar *&bytes, size_t targetLength, OutT *out, Fn &&fn) {
+        const MarkerConfig config = getMarkerConfig(targetLength);
+        if (!config.enabled) {
+            return false;
+        }
+        const size_t encodedLength = *reinterpret_cast<const size_t *>(bytes);
+        bytes += sizeof(size_t);
+        const uint64_t *bitOffsets = read_marker_header(bytes, config);
+        const uchar *bitstream = bytes;
+
+        if (treeRoot->t) {
+            const T sym = treeRoot->c + offset;
+            for (size_t i = 0; i < targetLength; i++) out[i] = fn(i, sym);
+            bytes += encodedLength;
+            return true;
+        }
+        build_fast_table();
+        const size_t fastBitLimit = encodedLength >= 8 ? (encodedLength - 7) * 8 : 0;
+        const size_t plane = config.blockDimX * config.blockDimY;
+        for (size_t ordinal = 0; ordinal < config.chunkCount; ++ordinal) {
+            size_t bitIndex = bitOffsets[ordinal];
+            const size_t rowMajorChunk = morton_to_row_major_chunk(ordinal, config);
+            const size_t cx = rowMajorChunk % config.chunksPerDimX;
+            const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+            const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
+            const size_t x0 = cx * config.chunkDim;
+            const size_t y0 = cy * config.chunkDim;
+            const size_t z0 = cz * config.chunkDim;
+            for (size_t lz = 0; lz < config.chunkDim; ++lz) {
+                const size_t zBase = (z0 + lz) * plane;
+                for (size_t ly = 0; ly < config.chunkDim; ++ly) {
+                    const size_t rowBase = zBase + (y0 + ly) * config.blockDimX + x0;
+                    decode_run_fast(bitstream, bitIndex, fastBitLimit, config.chunkDim,
+                                    [&](size_t k, T sym) { out[rowBase + k] = fn(rowBase + k, sym); });
+                }
+            }
+        }
+        bytes += encodedLength;
+        return true;
+    }
+
+    // Table-accelerated variant of decode_marked_chunks(). Same output.
+    std::vector<T> decode_marked_chunks_fast(const uchar *&bytes, size_t targetLength,
+                                             const std::vector<size_t> &rowMajorChunks) {
+        const size_t encodedLength = *reinterpret_cast<const size_t *>(bytes);
+        bytes += sizeof(size_t);
+        const MarkerConfig config = getMarkerConfig(targetLength);
+        if (!config.enabled) {
+            bytes -= sizeof(size_t);
+            return decode_fast(bytes, targetLength);
+        }
+        const uint64_t *bitOffsets = read_marker_header(bytes, config);
+        const uchar *bitstream = bytes;
+
+        const size_t chunkVolume = config.chunkDim * config.chunkDim * config.chunkDim;
+        std::vector<T> out(rowMajorChunks.size() * chunkVolume);
+        if (treeRoot->t) {
+            std::fill(out.begin(), out.end(), treeRoot->c + offset);
+            bytes += encodedLength;
+            return out;
+        }
+        build_fast_table();
+        const size_t fastBitLimit = encodedLength >= 8 ? (encodedLength - 7) * 8 : 0;
+
+        size_t outOffset = 0;
+        for (size_t rowMajorChunk : rowMajorChunks) {
+            const size_t ordinal = row_major_chunk_to_morton(rowMajorChunk, config);
+            size_t bitIndex = bitOffsets[ordinal];
+            T *dst = out.data() + outOffset;
+            decode_run_fast(bitstream, bitIndex, fastBitLimit, chunkVolume,
+                            [dst](size_t k, T sym) { dst[k] = sym; });
+            outOffset += chunkVolume;
+        }
+
+        bytes += encodedLength;
+        return out;
+    }
+
     // empty function
     void postprocess_decode() override { SZ_FreeHuffman(); }
 
@@ -305,27 +431,41 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
         treeRoot = reconstruct_HuffTree_from_bytes_anyStates(c + sizeof(int) + sizeof(int), nodeCount);
         c += sizeof(int) + sizeof(int) + encodeStartIndex;
         loaded = true;
+        fastTableBuilt = false;  // tree changed; any cached fast-decode table is stale
     }
 
     bool isLoaded() const { return loaded; }
 
     static void set_forced_marker(size_t blockDim, size_t chunkDim) {
-        forced_marker_block_dim() = blockDim;
+        set_forced_marker(blockDim, blockDim, blockDim, chunkDim);
+    }
+
+    static void set_forced_marker(size_t blockDimX, size_t blockDimY, size_t blockDimZ, size_t chunkDim) {
+        forced_marker_block_dim_x() = blockDimX;
+        forced_marker_block_dim_y() = blockDimY;
+        forced_marker_block_dim_z() = blockDimZ;
         forced_marker_chunk_dim() = chunkDim;
     }
 
     static void clear_forced_marker() {
-        forced_marker_block_dim() = 0;
+        forced_marker_block_dim_x() = 0;
+        forced_marker_block_dim_y() = 0;
+        forced_marker_block_dim_z() = 0;
         forced_marker_chunk_dim() = 0;
     }
 
    private:
     struct MarkerConfig {
         bool enabled = false;
-        size_t blockDim = 0;
+        size_t blockDimX = 0;
+        size_t blockDimY = 0;
+        size_t blockDimZ = 0;
         size_t chunkDim = 0;
-        size_t chunksPerDim = 0;
+        size_t chunksPerDimX = 0;
+        size_t chunksPerDimY = 0;
+        size_t chunksPerDimZ = 0;
         size_t chunkCount = 0;
+        bool useMorton = false;
     };
 
     HuffmanTree *huffmanTree = NULL;
@@ -336,7 +476,127 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
     T offset;
     size_t markerSizeEst = 0;
 
-    static size_t &forced_marker_block_dim() {
+    // ------- table-accelerated decoding (used by decode_fast / decode_marked_chunks_fast) -------
+    // The residual streams average ~1 bit per symbol, so a per-symbol lookup
+    // barely beats the tree walk. Instead each kFastTableBits-wide prefix entry
+    // pre-decodes every complete code inside the window (up to kFastMaxSyms
+    // symbols at once), with cumulative bit counts so a run can stop mid-entry.
+    static constexpr int kFastTableBits = 12;
+    static constexpr int kFastMaxSyms = kFastTableBits;  // codes are >= 1 bit each
+    struct FastDecodeEntry {
+        T syms[kFastMaxSyms];
+        uint8_t cumBits[kFastMaxSyms];  // bits consumed after emitting syms[0..k]
+        uint8_t nsym;                   // complete symbols in the window; 0 -> escape
+    };
+    std::vector<FastDecodeEntry> fastTable;
+    std::vector<node> fastEscape;  // subtree to continue the walk from, for escape prefixes
+    bool fastTableBuilt = false;
+
+    void build_fast_table() {
+        if (fastTableBuilt) return;
+        const size_t tableSize = static_cast<size_t>(1) << kFastTableBits;
+        fastTable.assign(tableSize, FastDecodeEntry{});
+        fastEscape.assign(tableSize, nullptr);
+        if (!treeRoot->t) {
+            for (size_t p = 0; p < tableSize; ++p) {
+                FastDecodeEntry &e = fastTable[p];
+                node n = treeRoot;
+                int bit = 0;
+                int count = 0;
+                while (bit < kFastTableBits && count < kFastMaxSyms) {
+                    n = ((p >> (kFastTableBits - 1 - bit)) & 1) ? n->right : n->left;
+                    ++bit;
+                    if (n->t) {
+                        e.syms[count] = n->c + offset;
+                        e.cumBits[count] = static_cast<uint8_t>(bit);
+                        ++count;
+                        n = treeRoot;
+                    }
+                }
+                e.nsym = static_cast<uint8_t>(count);
+                if (count == 0) {
+                    fastEscape[p] = n;  // node reached after consuming the whole window
+                }
+            }
+        }
+        fastTableBuilt = true;
+    }
+
+    static inline uint64_t load_u64_bigendian(const uchar *p) {
+        return (static_cast<uint64_t>(p[0]) << 56) | (static_cast<uint64_t>(p[1]) << 48) |
+               (static_cast<uint64_t>(p[2]) << 40) | (static_cast<uint64_t>(p[3]) << 32) |
+               (static_cast<uint64_t>(p[4]) << 24) | (static_cast<uint64_t>(p[5]) << 16) |
+               (static_cast<uint64_t>(p[6]) << 8) | static_cast<uint64_t>(p[7]);
+    }
+
+    // Decode `count` symbols, calling emit(k, sym) for k = 0..count-1.
+    // fastBitLimit guards the unaligned 8-byte peek: below it, bytes
+    // [bitIndex>>3, bitIndex>>3 + 8) are inside the bitstream. The stream tail
+    // (and codes longer than the table window) fall back to the bit-by-bit walk.
+    template <class Emit>
+    inline void decode_run_fast(const uchar *bitstream, size_t &bitIndex, size_t fastBitLimit,
+                                size_t count, Emit &&emit) {
+        size_t i = 0;
+        while (i < count) {
+            if (bitIndex < fastBitLimit) {
+                const uint64_t window = load_u64_bigendian(bitstream + (bitIndex >> 3));
+                const uint32_t prefix =
+                    static_cast<uint32_t>((window << (bitIndex & 7)) >> (64 - kFastTableBits));
+                const FastDecodeEntry &e = fastTable[prefix];
+                if (e.nsym) {
+                    const size_t m = std::min<size_t>(e.nsym, count - i);
+                    for (size_t k = 0; k < m; ++k) emit(i + k, e.syms[k]);
+                    bitIndex += e.cumBits[m - 1];
+                    i += m;
+                    continue;
+                }
+                // first code is longer than the window: finish it with a tree walk
+                size_t bi = bitIndex + kFastTableBits;
+                node n = fastEscape[prefix];
+                while (!n->t) {
+                    n = ((bitstream[bi >> 3] >> (7 - (bi & 7))) & 0x01) ? n->right : n->left;
+                    ++bi;
+                }
+                emit(i, n->c + offset);
+                ++i;
+                bitIndex = bi;
+                continue;
+            }
+            emit(i, decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot));
+            ++i;
+        }
+    }
+
+    void decode_chunk_to_full_fast(std::vector<T> &out, const uchar *bitstream, size_t &bitIndex,
+                                   size_t rowMajorChunk, const MarkerConfig &config, size_t fastBitLimit) {
+        const size_t cx = rowMajorChunk % config.chunksPerDimX;
+        const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+        const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
+        const size_t x0 = cx * config.chunkDim;
+        const size_t y0 = cy * config.chunkDim;
+        const size_t z0 = cz * config.chunkDim;
+        const size_t plane = config.blockDimX * config.blockDimY;
+        for (size_t lz = 0; lz < config.chunkDim; ++lz) {
+            const size_t zBase = (z0 + lz) * plane;
+            for (size_t ly = 0; ly < config.chunkDim; ++ly) {
+                T *row = out.data() + zBase + (y0 + ly) * config.blockDimX + x0;
+                decode_run_fast(bitstream, bitIndex, fastBitLimit, config.chunkDim,
+                                [row](size_t k, T sym) { row[k] = sym; });
+            }
+        }
+    }
+
+    static size_t &forced_marker_block_dim_x() {
+        static thread_local size_t value = 0;
+        return value;
+    }
+
+    static size_t &forced_marker_block_dim_y() {
+        static thread_local size_t value = 0;
+        return value;
+    }
+
+    static size_t &forced_marker_block_dim_z() {
         static thread_local size_t value = 0;
         return value;
     }
@@ -348,29 +608,42 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
     MarkerConfig getMarkerConfig(size_t num_bin) const {
         MarkerConfig config;
-        const size_t forcedBlockDim = forced_marker_block_dim();
+        const size_t forcedBlockDimX = forced_marker_block_dim_x();
+        const size_t forcedBlockDimY = forced_marker_block_dim_y();
+        const size_t forcedBlockDimZ = forced_marker_block_dim_z();
         const size_t forcedChunkDim = forced_marker_chunk_dim();
-        if (forcedBlockDim > 0 && forcedChunkDim > 0 &&
-            num_bin == forcedBlockDim * forcedBlockDim * forcedBlockDim) {
+        if (forcedBlockDimX > 0 && forcedBlockDimY > 0 && forcedBlockDimZ > 0 && forcedChunkDim > 0 &&
+            num_bin == forcedBlockDimX * forcedBlockDimY * forcedBlockDimZ) {
             config.enabled = true;
-            config.blockDim = forcedBlockDim;
+            config.blockDimX = forcedBlockDimX;
+            config.blockDimY = forcedBlockDimY;
+            config.blockDimZ = forcedBlockDimZ;
             config.chunkDim = forcedChunkDim;
         } else if (num_bin == static_cast<size_t>(128) * 128 * 128) {
             config.enabled = true;
-            config.blockDim = 128;
+            config.blockDimX = config.blockDimY = config.blockDimZ = 128;
             config.chunkDim = 16;
         } else if (num_bin == static_cast<size_t>(256) * 256 * 256) {
             config.enabled = true;
-            config.blockDim = 256;
+            config.blockDimX = config.blockDimY = config.blockDimZ = 256;
             config.chunkDim = 32;
         } else {
             return config;
         }
-        if (config.blockDim == 0 || config.chunkDim == 0 || config.blockDim % config.chunkDim != 0) {
+        if (config.blockDimX == 0 || config.blockDimY == 0 || config.blockDimZ == 0 ||
+            config.chunkDim == 0 ||
+            config.blockDimX % config.chunkDim != 0 ||
+            config.blockDimY % config.chunkDim != 0 ||
+            config.blockDimZ % config.chunkDim != 0) {
             return MarkerConfig{};
         }
-        config.chunksPerDim = config.blockDim / config.chunkDim;
-        config.chunkCount = config.chunksPerDim * config.chunksPerDim * config.chunksPerDim;
+        config.chunksPerDimX = config.blockDimX / config.chunkDim;
+        config.chunksPerDimY = config.blockDimY / config.chunkDim;
+        config.chunksPerDimZ = config.blockDimZ / config.chunkDim;
+        config.chunkCount = config.chunksPerDimX * config.chunksPerDimY * config.chunksPerDimZ;
+        config.useMorton = config.chunksPerDimX == config.chunksPerDimY &&
+                           config.chunksPerDimX == config.chunksPerDimZ &&
+                           (config.chunksPerDimX & (config.chunksPerDimX - 1)) == 0;
         return config;
     }
 
@@ -382,8 +655,12 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
     std::vector<size_t> morton_chunk_order(const MarkerConfig &config) const {
         std::vector<size_t> order;
         order.reserve(config.chunkCount);
+        if (!config.useMorton) {
+            for (size_t i = 0; i < config.chunkCount; ++i) order.push_back(i);
+            return order;
+        }
         size_t bits = 0;
-        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
+        while ((static_cast<size_t>(1) << bits) < config.chunksPerDimX) {
             bits++;
         }
         for (size_t code = 0; code < config.chunkCount; ++code) {
@@ -393,14 +670,15 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
                 cy |= ((code >> (3 * bit + 1)) & 1u) << bit;
                 cz |= ((code >> (3 * bit + 2)) & 1u) << bit;
             }
-            order.push_back((cz * config.chunksPerDim + cy) * config.chunksPerDim + cx);
+            order.push_back((cz * config.chunksPerDimY + cy) * config.chunksPerDimX + cx);
         }
         return order;
     }
 
     size_t morton_to_row_major_chunk(size_t ordinal, const MarkerConfig &config) const {
+        if (!config.useMorton) return ordinal;
         size_t bits = 0;
-        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
+        while ((static_cast<size_t>(1) << bits) < config.chunksPerDimX) {
             bits++;
         }
         size_t cx = 0, cy = 0, cz = 0;
@@ -409,15 +687,16 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
             cy |= ((ordinal >> (3 * bit + 1)) & 1u) << bit;
             cz |= ((ordinal >> (3 * bit + 2)) & 1u) << bit;
         }
-        return (cz * config.chunksPerDim + cy) * config.chunksPerDim + cx;
+        return (cz * config.chunksPerDimY + cy) * config.chunksPerDimX + cx;
     }
 
     size_t row_major_chunk_to_morton(size_t rowMajorChunk, const MarkerConfig &config) const {
-        const size_t cx = rowMajorChunk % config.chunksPerDim;
-        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
-        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
+        if (!config.useMorton) return rowMajorChunk;
+        const size_t cx = rowMajorChunk % config.chunksPerDimX;
+        const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+        const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
         size_t bits = 0;
-        while ((static_cast<size_t>(1) << bits) < config.chunksPerDim) {
+        while ((static_cast<size_t>(1) << bits) < config.chunksPerDimX) {
             bits++;
         }
         size_t ordinal = 0;
@@ -505,17 +784,17 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
     void encode_chunk_symbols(const T *bins, size_t rowMajorChunk, const MarkerConfig &config,
                               uchar *&p, size_t &outSize, size_t &totalBitSize, int &lackBits) {
-        const size_t cx = rowMajorChunk % config.chunksPerDim;
-        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
-        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
+        const size_t cx = rowMajorChunk % config.chunksPerDimX;
+        const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+        const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
         const size_t x0 = cx * config.chunkDim;
         const size_t y0 = cy * config.chunkDim;
         const size_t z0 = cz * config.chunkDim;
-        const size_t plane = config.blockDim * config.blockDim;
+        const size_t plane = config.blockDimX * config.blockDimY;
         for (size_t lz = 0; lz < config.chunkDim; ++lz) {
             const size_t zBase = (z0 + lz) * plane;
             for (size_t ly = 0; ly < config.chunkDim; ++ly) {
-                size_t index = zBase + (y0 + ly) * config.blockDim + x0;
+                size_t index = zBase + (y0 + ly) * config.blockDimX + x0;
                 for (size_t lx = 0; lx < config.chunkDim; ++lx, ++index) {
                     encode_one_symbol(bins, index, p, outSize, totalBitSize, lackBits);
                 }
@@ -561,17 +840,17 @@ class HuffmanEncoder : public concepts::EncoderInterface<T> {
 
     void decode_chunk_to_full(std::vector<T> &out, const uchar *bitstream, size_t &bitIndex,
                               size_t rowMajorChunk, const MarkerConfig &config) const {
-        const size_t cx = rowMajorChunk % config.chunksPerDim;
-        const size_t cy = (rowMajorChunk / config.chunksPerDim) % config.chunksPerDim;
-        const size_t cz = rowMajorChunk / (config.chunksPerDim * config.chunksPerDim);
+        const size_t cx = rowMajorChunk % config.chunksPerDimX;
+        const size_t cy = (rowMajorChunk / config.chunksPerDimX) % config.chunksPerDimY;
+        const size_t cz = rowMajorChunk / (config.chunksPerDimX * config.chunksPerDimY);
         const size_t x0 = cx * config.chunkDim;
         const size_t y0 = cy * config.chunkDim;
         const size_t z0 = cz * config.chunkDim;
-        const size_t plane = config.blockDim * config.blockDim;
+        const size_t plane = config.blockDimX * config.blockDimY;
         for (size_t lz = 0; lz < config.chunkDim; ++lz) {
             const size_t zBase = (z0 + lz) * plane;
             for (size_t ly = 0; ly < config.chunkDim; ++ly) {
-                size_t index = zBase + (y0 + ly) * config.blockDim + x0;
+                size_t index = zBase + (y0 + ly) * config.blockDimX + x0;
                 for (size_t lx = 0; lx < config.chunkDim; ++lx, ++index) {
                     out[index] = decode_one_symbol_from_bit(bitstream, bitIndex, treeRoot);
                 }
